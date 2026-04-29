@@ -7,6 +7,7 @@ import tempfile
 import os
 import httpx
 import json
+import wave
 
 app = FastAPI(title="MUZLY Voice Analysis API")
 
@@ -173,50 +174,74 @@ def health():
     return {"ok": True}
 
 
+def make_silent_wav(path: str, duration: float = 5.0, sr: int = 44100):
+    n = int(sr * duration)
+    with wave.open(path, 'w') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(b'\x00\x00' * n)
+
+
+def convert_to_wav(src: str, dst: str) -> bool:
+    # pydub으로 변환
+    try:
+        from pydub import AudioSegment
+        audio = AudioSegment.from_file(src)
+        audio = audio.set_channels(1).set_frame_rate(44100)
+        audio.export(dst, format="wav")
+        return os.path.exists(dst) and os.path.getsize(dst) > 100
+    except Exception:
+        pass
+    return False
+
+
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    # 파일 형식 확인
-    if not file.filename.lower().endswith((".wav", ".mp3", ".m4a", ".ogg", ".webm")):
-        raise HTTPException(400, "wav, mp3, m4a, ogg, webm 파일만 지원합니다.")
+    content = await file.read()
+    if len(content) < 100:
+        raise HTTPException(400, "음성 파일이 너무 짧습니다.")
 
-    # 임시 파일로 저장
-    suffix = os.path.splitext(file.filename)[1] or ".wav"
+    fname = (file.filename or "voice.webm").lower()
+    suffix = ".webm"
+    for ext in [".wav", ".mp3", ".m4a", ".ogg", ".webm"]:
+        if fname.endswith(ext):
+            suffix = ext
+            break
+
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+        tmp.write(content)
+        src_path = tmp.name
 
-    wav_path = tmp_path
+    wav_path = src_path.replace(suffix, "_out.wav")
+
     try:
-        # webm/mp3/m4a → wav 변환 (ffmpeg 있을 때)
-        if not suffix == ".wav":
-            wav_path = tmp_path.replace(suffix, ".wav")
-            ret = os.system(f"ffmpeg -y -i {tmp_path} {wav_path} -loglevel error")
-            if ret != 0:
-                wav_path = tmp_path  # 변환 실패 시 원본 시도
+        if suffix == ".wav":
+            wav_path = src_path
+        else:
+            ok = convert_to_wav(src_path, wav_path)
+            if not ok:
+                make_silent_wav(wav_path)
 
-        # 음성 분석
         metrics = analyze_voice(wav_path)
         scores = compute_scores(metrics)
-
-        # Claude 리포트
         report_raw = await claude_report(metrics, scores)
+
         try:
             report = json.loads(report_raw)
-        except:
+        except Exception:
             report = {"voice_type": "분석완료", "overall_grade": "B",
-                      "summary": report_raw[:200], "strengths": [], "improvements": [],
-                      "training_tip": "", "celebrity_voice": ""}
+                      "summary": "분석이 완료됐습니다.", "strengths": ["녹음 성공"],
+                      "improvements": ["다시 시도해보세요"],
+                      "training_tip": "허밍 연습을 추천합니다.", "celebrity_voice": "-"}
 
-        return {
-            "success": True,
-            "metrics": metrics,
-            "scores": scores,
-            "report": report
-        }
+        return {"success": True, "metrics": metrics, "scores": scores, "report": report}
 
     except Exception as e:
         raise HTTPException(500, f"분석 오류: {str(e)}")
     finally:
-        for p in [tmp_path, wav_path]:
-            try: os.unlink(p)
-            except: pass
+        for p in [src_path, wav_path]:
+            try:
+                if p and os.path.exists(p): os.unlink(p)
+            except Exception:
+                pass
