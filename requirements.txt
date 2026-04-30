@@ -9,3 +9,4 @@ soundfile
 scipy
 torchcrepe
 torch
+librosa
